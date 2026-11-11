@@ -1,0 +1,107 @@
+trigger:
+ - main
+parameters:
+ - name: simulateTampering
+ displayName: 'Simulate tampering with the artifact (the integrity check should fail)'
+ type: boolean
+ default: false
+pool:
+ vmImage: 'ubuntu-latest'
+stages:
+ - stage: CodeChecks
+ displayName: '1. Code checks'
+ jobs:
+ - job: SecretScan
+ steps:
+ - script: bash security/check-secrets.sh
+ displayName: 'Gate 1: scan the repository for secrets'
+ - stage: Build
+ displayName: '2. Build and record the artifact hash'
+ dependsOn: CodeChecks
+ jobs:
+ - job: BuildImage
+ steps:
+ - script: |
+ set -euo pipefail
+ mkdir -p $(Build.ArtifactStagingDirectory)/image
+ docker build -t demobook:ci app
+ docker save demobook:ci -o $(Build.ArtifactStagingDirectory)/image/demobookimage.tar
+ cd $(Build.ArtifactStagingDirectory)/image
+ sha256sum demobook-image.tar | tee demobook-image.tar.sha256
+ displayName: 'Build the image, save it and record its SHA-256'
+ - publish: $(Build.ArtifactStagingDirectory)/image
+ artifact: image
+ displayName: 'Publish the image and its hash'
+ - stage: SecurityTest
+ displayName: '3. Verify integrity and scan with ZAP'
+ dependsOn: Build
+ jobs:
+ - job: VerifyAndScan
+ steps:
+ - download: current
+ artifact: image
+ - ${{ if eq(parameters.simulateTampering, true) }}:
+  script: echo "tampered" >> $(Pipeline.Workspace)/image/demobook-image.tar
+ displayName: 'SIMULATION: tamper with the downloaded artifact'
+ - script: |
+ set -euo pipefail
+ cd $(Pipeline.Workspace)/image
+ sha256sum -c demobook-image.tar.sha256
+ displayName: 'Gate 2: verify the artifact SHA-256 before using it'
+ - script: |
+ set -euo pipefail
+ docker load -i $(Pipeline.Workspace)/image/demobook-image.tar
+ docker network create sec-net
+ docker run -d --name demoapp --network sec-net -p 8080:80 demobook:ci
+ for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+ if curl -fsS -o /dev/null http://localhost:8080/; then break; fi
+ sleep 2
+ done
+ echo "--- Response headers the scanner will judge ---"
+ curl -sSI http://localhost:8080/
+ displayName: 'Start the application and show its response headers'
+ - script: |
+ set -euo pipefail
+ mkdir -p "$PWD/zap-out"
+ chmod 777 "$PWD/zap-out"
+ printf '10038\tFAIL\t(CSP header not set)\n10020\tFAIL\t(Anti-clickjacking
+header)\n10021\tFAIL\t(X-Content-Type-Options header)\n' > "$PWD/zap-out/zap-rules.conf"
+ set +e
+ docker run --rm --network sec-net -v "$PWD/zap-out":/zap/wrk/:rw -t
+ghcr.io/zaproxy/zaproxy:stable zap-baseline.py -t http://demoapp -c zap-rules.conf -r zapreport.html -I
+ rc=$?
+ set -e
+ echo "ZAP exit code: $rc"
+ exit $rc
+ displayName: 'Gate 3: ZAP baseline scan (fails on missing security headers)'
+ - ${{ if eq(parameters.simulateTampering, false) }}:
+ - publish: $(System.DefaultWorkingDirectory)/zap-out
+ artifact: zap-report
+ condition: succeededOrFailed()
+ displayName: 'Publish the ZAP report'
+ - stage: ReleaseRecord
+ displayName: '4. Record the release'
+ dependsOn: SecurityTest
+ jobs:
+ - job: Record
+ steps:
+ - download: current
+ artifact: image
+ - script: |
+ set -euo pipefail
+ mkdir -p "$PWD/record"
+ read -r HASH REST < "$(Pipeline.Workspace)/image/demobook-image.tar.sha256"
+ {
+ echo "Build number : $(Build.BuildNumber)"
+ echo "Commit : $(Build.SourceVersion)"
+ echo "Branch : $(Build.SourceBranchName)"
+ echo "Triggered by : $(Build.RequestedFor)"
+ echo "Reason : $(Build.Reason)"
+ echo "Image SHA-256: $HASH"
+ echo "Checks passed: secret scan, SHA-256 verification, ZAP baseline"
+ echo "Recorded at : `date -u +%Y-%m-%dT%H:%M:%SZ`"
+ } | tee "$PWD/record/release-record.txt"
+ displayName: 'Write the release record'
+ - publish: $(System.DefaultWorkingDirectory)/record
+ artifact: release-record
+ displayName: 'Publish the release record'
